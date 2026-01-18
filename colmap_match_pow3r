@@ -1,0 +1,220 @@
+import os  
+import sys  
+import argparse  
+import tempfile  
+import shutil  
+from pathlib import Path
+import os.path as path 
+  
+import torch  
+import numpy as np  
+from tqdm import tqdm  
+import PIL.Image  
+  
+import pow3r.tools.path_to_dust3r  
+from pow3r.model.inference import AsymmetricSliding  
+   
+from mast3r.colmap.mapping import scene_prepare_images, run_mast3r_matching, kapture_import_image_folder_or_list  
+from mast3r.image_pairs import make_pairs  
+  
+import kapture  
+from kapture.converter.colmap.database import COLMAPDatabase  
+from kapture.converter.colmap.database_extra import kapture_to_colmap  
+import pycolmap  
+  
+  
+def kapture_import_image_folder_or_list_with_original_params(images_path, use_single_camera=False):   
+    images = kapture.RecordsCamera()  
+      
+    if isinstance(images_path, str):  
+        images_root = images_path  
+        file_list = [path.relpath(path.join(dirpath, filename), images_root)  
+                     for dirpath, dirs, filenames in os.walk(images_root)  
+                     for filename in filenames]  
+        file_list = sorted(file_list)  
+    else:  
+        images_root, file_list = images_path  
+  
+    sensors = kapture.Sensors()  
+    for n, filename in enumerate(file_list):  
+        try:   
+            with PIL.Image.open(path.join(images_root, filename)) as im:  
+                width, height = im.size  
+                model_params = [width, height]  
+        except (OSError, PIL.UnidentifiedImageError):  
+            print(f'Skipping invalid image file {filename}')  
+            continue  
+  
+        camera_id = f'sensor'  
+        if use_single_camera and camera_id not in sensors:  
+            sensors[camera_id] = kapture.Camera(kapture.CameraType.UNKNOWN_CAMERA, model_params)  
+        elif use_single_camera:  
+            assert sensors[camera_id].camera_params[0] == width and sensors[camera_id].camera_params[1] == height  
+        else:  
+            camera_id = camera_id + f'{n}'  
+            sensors[camera_id] = kapture.Camera(kapture.CameraType.UNKNOWN_CAMERA, model_params)  
+  
+        images[(n, camera_id)] = filename  
+  
+    return kapture.Kapture(sensors=sensors, records_camera=images)  
+  
+  
+def run_pow3r_with_mast3r_pipeline(model, maxdim: int, patch_size: int, device,  
+                                  kdata, root_path: str, image_pairs_kapture,  
+                                  colmap_db, conf_thr: float, skip_geometric_verification: bool,  
+                                  min_len_track: int):  
+    """使用mast3r的pipeline但替换为Pow3R模型"""  
+    return run_mast3r_matching(  
+        model=model,  # 传入Pow3R的AsymmetricSliding模型  
+        maxdim=maxdim,  
+        patch_size=patch_size,  
+        device=device,  
+        kdata=kdata,  
+        root_path=root_path,  
+        image_pairs_kapture=image_pairs_kapture,  
+        colmap_db=colmap_db,  
+        dense_matching=False,  
+        pixel_tol=2,  
+        conf_thr=conf_thr,  
+        skip_geometric_verification=skip_geometric_verification,  
+        min_len_track=min_len_track  
+    )  
+  
+  
+def main():  
+    parser = argparse.ArgumentParser(description='使用mast3r pipeline为COLMAP生成Pow3R匹配')  
+    parser.add_argument('--image_dir', required=True, help='包含图像的目录')  
+    parser.add_argument('--output_db', required=True, help='输出COLMAP数据库路径')  
+    parser.add_argument('--ckpt_path', type=str,   
+                        default='checkpoints/Pow3R_ViTLarge_BaseDecoder_512_linear.pth',  
+                        help='Pow3R模型检查点路径')  
+    parser.add_argument('--device', default='cuda', help='使用的设备')  
+    parser.add_argument('--scene_graph', default='complete',     
+                        help='配对策略 (complete, swin-3, logwin-5, etc.)')  
+    parser.add_argument('--conf_thr', type=float, default=1.001, help='置信度阈值')  
+    parser.add_argument('--min_len_track', type=int, default=3, help='最小轨迹长度')  
+    parser.add_argument('--image_size', type=int, default=512, help='处理图像尺寸')  
+    parser.add_argument('--shared_intrinsics', action='store_true',     
+                        help='为所有图像使用共享相机内参')  
+      
+    args = parser.parse_args()  
+      
+    # 验证输入目录  
+    if not os.path.isdir(args.image_dir):  
+        print(f"错误：图像目录 {args.image_dir} 不存在")  
+        sys.exit(1)  
+      
+    # 查找图像文件  
+    image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff'}  
+    image_files = []  
+    for ext in image_extensions:  
+        image_files.extend(Path(args.image_dir).glob(f'*{ext}'))  
+        image_files.extend(Path(args.image_dir).glob(f'*{ext.upper()}'))  
+      
+    image_files = sorted([str(f) for f in image_files])  
+      
+    if len(image_files) == 0:  
+        print(f"错误：在 {args.image_dir} 中未找到图像")  
+        sys.exit(1)  
+      
+    print(f"找到 {len(image_files)} 张图像")  
+      
+    # 加载Pow3R模型  
+    print("正在加载Pow3R模型...")  
+    ckpt = torch.load(args.ckpt_path, map_location='cpu', weights_only=False)  
+      
+    crop_res = (384, 512)  
+    model = AsymmetricSliding(crop_res, bootstrap_depth='c2f_both', fix_rays='full', sparsify_depth=1.1)  
+    model.load_from_checkpoint(ckpt)  
+    model = model.to(args.device)  
+      
+    # 创建临时处理目录  
+    with tempfile.TemporaryDirectory() as temp_dir:  
+        print(f"使用临时目录：{temp_dir}")  
+          
+        # 准备图像路径  
+        root_path = args.image_dir  
+        image_paths = [os.path.relpath(img, root_path) for img in image_files]  
+         
+        print("正在创建kapture数据结构...")  
+        kdata = kapture_import_image_folder_or_list_with_original_params(  
+            (root_path, image_paths),     
+            use_single_camera=args.shared_intrinsics  
+        )  
+          
+        # 使用mast3r的函数生成图像对  
+        print(f"使用策略生成图像对：{args.scene_graph}")  
+        imgs = scene_prepare_images(root_path, args.image_size, 16, image_paths)  
+        pairs = make_pairs(imgs, scene_graph=args.scene_graph, prefilter=None, symmetrize=False)  
+          
+        image_pairs = [  
+            (image_paths[pair[0]['idx']], image_paths[pair[1]['idx']])  
+            for pair in pairs  
+        ]  
+          
+        print(f"生成了 {len(image_pairs)} 个图像对")  
+          
+        # 创建COLMAP数据库  
+        print("正在创建COLMAP数据库...")  
+        os.makedirs(os.path.dirname(args.output_db), exist_ok=True)  
+        colmap_db_path = os.path.join(temp_dir, 'colmap.db')  
+        colmap_db = COLMAPDatabase.connect(colmap_db_path)  
+          
+        try:  
+            # 导出图像到数据库  
+            print("正在导出图像到数据库...")  
+            kapture_to_colmap(kdata, root_path, tar_handler=None, database=colmap_db,  
+                              keypoints_type=None, descriptors_type=None, export_two_view_geometry=False)  
+              
+            # 使用mast3r的pipeline运行Pow3R匹配  
+            print("正在运行Pow3R匹配...")  
+            colmap_image_pairs = run_pow3r_with_mast3r_pipeline(  
+                model=model,  
+                maxdim=args.image_size,  
+                patch_size=16,  
+                device=args.device,  
+                kdata=kdata,  
+                root_path=root_path,  
+                image_pairs_kapture=image_pairs,  
+                colmap_db=colmap_db,  
+                conf_thr=args.conf_thr,  
+                skip_geometric_verification=False,  
+                min_len_track=args.min_len_track  
+            )  
+              
+            print(f"成功处理了 {len(colmap_image_pairs)} 个图像对")  
+              
+            # 几何验证  
+            if len(colmap_image_pairs) > 0:  
+                print("正在进行几何验证...")  
+                pairs_file = os.path.join(temp_dir, 'pairs.txt')  
+                with open(pairs_file, 'w') as f:  
+                    for img1, img2 in colmap_image_pairs:  
+                        f.write(f"{img1} {img2}\n")  
+                  
+                pycolmap.verify_matches(colmap_db_path, pairs_file)  
+                print("几何验证完成")  
+              
+            # 复制数据库到输出位置  
+            shutil.copy2(colmap_db_path, args.output_db)  
+            print(f"输出数据库已保存到：{args.output_db}")  
+              
+            # 验证数据库内容  
+            print("\n验证数据库内容:")  
+            cursor = colmap_db.execute("SELECT COUNT(*) FROM keypoints")  
+            keypoints_count = cursor.fetchone()[0]  
+            cursor = colmap_db.execute("SELECT COUNT(*) FROM matches")  
+            matches_count = cursor.fetchone()[0]  
+            print(f"数据库中关键点数量: {keypoints_count}")  
+            print(f"数据库中匹配数量: {matches_count}")  
+              
+        except Exception as e:  
+            print(f"处理过程中出错：{e}")  
+            colmap_db.close()  
+            sys.exit(1)  
+        finally:  
+            colmap_db.close()  
+  
+  
+if __name__ == '__main__':  
+    main()
