@@ -1,0 +1,152 @@
+import os  
+import sys  
+import argparse  
+import tempfile  
+import shutil  
+from pathlib import Path  
+  
+import torch  
+import numpy as np  
+from tqdm import tqdm  
+import PIL.Image  
+  
+from mast3r.model import AsymmetricMASt3R  
+from mast3r.colmap.mapping import scene_prepare_images, run_mast3r_matching, kapture_import_image_folder_or_list  
+from mast3r.image_pairs import make_pairs  
+  
+import kapture  
+from kapture.converter.colmap.database import COLMAPDatabase  
+from kapture.converter.colmap.database_extra import kapture_to_colmap  
+import pycolmap  
+
+
+def main():  
+    parser = argparse.ArgumentParser(description='Generate MASt3R matches for COLMAP')  
+    parser.add_argument('--image_dir', required=True, help='Directory containing images')  
+    parser.add_argument('--output_db', required=True, help='Output COLMAP database path')  
+    parser.add_argument('--model_name', default='MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric',  
+                        help='MASt3R model name')  
+    parser.add_argument('--weights', type=str, help='Path to model weights')  
+    parser.add_argument('--device', default='cuda', help='Device to use')  
+    parser.add_argument('--scene_graph', default='complete',   
+                        help='Pairing strategy (complete, swin-3, logwin-5, etc.)')  
+    parser.add_argument('--conf_thr', type=float, default=1.001, help='Confidence threshold')  
+    parser.add_argument('--min_len_track', type=int, default=3, help='Minimum track length')  
+    parser.add_argument('--image_size', type=int, default=512, help='Image size for processing')  
+    parser.add_argument('--shared_intrinsics', action='store_true',   
+                        help='Use shared camera intrinsics for all images')  
+      
+    args = parser.parse_args()  
+      
+    # Validate input directory  
+    if not os.path.isdir(args.image_dir):  
+        print(f"Error: Image directory {args.image_dir} does not exist")  
+        sys.exit(1)  
+      
+    # Find image files  
+    image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff'}  
+    image_files = []  
+    for ext in image_extensions:  
+        image_files.extend(Path(args.image_dir).glob(f'*{ext}'))  
+        image_files.extend(Path(args.image_dir).glob(f'*{ext.upper()}'))  
+      
+    image_files = sorted([str(f) for f in image_files])  
+      
+    if len(image_files) == 0:  
+        print(f"Error: No images found in {args.image_dir}")  
+        sys.exit(1)  
+      
+    print(f"Found {len(image_files)} images")  
+      
+    # Load MASt3R model  
+    print("Loading MASt3R model...")  
+    if args.weights:  
+        model = AsymmetricMASt3R.from_pretrained(args.weights).to(args.device)  
+    else:  
+        model = AsymmetricMASt3R.from_pretrained(args.model_name).to(args.device)  
+      
+    # Create temporary directory for processing  
+    with tempfile.TemporaryDirectory() as temp_dir:  
+        print(f"Using temporary directory: {temp_dir}")  
+          
+        # Prepare image paths relative to root  
+        root_path = args.image_dir  
+        image_paths = [os.path.relpath(img, root_path) for img in image_files]  
+          
+        # Create kapture data structure using the original implementation  
+        print("Creating kapture data structure...")  
+        kdata = kapture_import_image_folder_or_list(  
+            (root_path, image_paths),   
+            use_single_camera=args.shared_intrinsics  
+        )  
+          
+        # Generate image pairs  
+        print(f"Generating image pairs using strategy: {args.scene_graph}")  
+        imgs = scene_prepare_images(root_path, args.image_size, 16, image_paths)  
+        pairs = make_pairs(imgs, scene_graph=args.scene_graph, prefilter=None, symmetrize=True)  
+          
+        # Convert pairs to image path format  
+        image_pairs = [  
+            (image_paths[pair[0]['idx']], image_paths[pair[1]['idx']])  
+            for pair in pairs  
+        ]  
+          
+        print(f"Generated {len(image_pairs)} image pairs")  
+          
+        # Create COLMAP database  
+        print("Creating COLMAP database...")  
+        os.makedirs(os.path.dirname(args.output_db), exist_ok=True)  
+        colmap_db_path = os.path.join(temp_dir, 'colmap.db')  
+        colmap_db = COLMAPDatabase.connect(colmap_db_path)  
+          
+        try:  
+            # Export kapture data to COLMAP database  
+            print("Exporting images to database...")  
+            kapture_to_colmap(kdata, root_path, tar_handler=None, database=colmap_db,  
+                              keypoints_type=None, descriptors_type=None, export_two_view_geometry=False)  
+              
+            # Run MASt3R matching  
+            print("Running MASt3R matching...")  
+            colmap_image_pairs = run_mast3r_matching(  
+                model=model,  
+                maxdim=args.image_size,  
+                patch_size=16,  
+                device=args.device,  
+                kdata=kdata,  
+                root_path=root_path,  
+                image_pairs_kapture=image_pairs,  
+                colmap_db=colmap_db,  
+                dense_matching=True,  
+                pixel_tol=2,  
+                conf_thr=args.conf_thr,  
+                skip_geometric_verification=False,    
+                min_len_track=args.min_len_track  
+            )  
+              
+            print(f"Successfully processed {len(colmap_image_pairs)} image pairs")  
+              
+            # 几何验证步骤  
+            print("Verifying matches...")  
+            pairs_file = os.path.join(temp_dir, 'pairs.txt')  
+            with open(pairs_file, 'w') as f:  
+                for img1, img2 in colmap_image_pairs:  
+                    f.write(f"{img1} {img2}\n")  
+              
+            # 使用 pycolmap 进行几何验证  
+            pycolmap.verify_matches(colmap_db_path, pairs_file)  
+            print("Geometric verification completed")  
+              
+            # Copy database to output location  
+            shutil.copy2(colmap_db_path, args.output_db)  
+            print(f"Output database saved to: {args.output_db}")  
+              
+        except Exception as e:  
+            print(f"Error during processing: {e}")  
+            colmap_db.close()  
+            sys.exit(1)  
+        finally:  
+            colmap_db.close()  
+  
+  
+if __name__ == '__main__':
+    main()
